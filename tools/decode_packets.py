@@ -292,11 +292,180 @@ def write_markdown(path: Path, metadata: dict[str, Any], segments: list[Segment]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def payload_object(decoded: dict[str, Any]) -> Any:
+    """Return the most useful decoded object for human reports."""
+    return decoded.get("request", decoded.get("response", decoded.get("text", "")))
+
+
+def compact_json(value: Any, max_chars: int = 1600) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if len(text) > max_chars:
+        return text[:max_chars] + "... <truncated; see decoded/decoded_packets.json for full payload>"
+    return text
+
+
+def write_dialogue_markdown(path: Path, metadata: dict[str, Any], segments: list[Segment], frames: list[dict[str, Any]], summary: dict[str, Any]) -> None:
+    """Write a packet-by-packet replay of all 192 TCP chunks."""
+    frames_by_segment: dict[int, list[dict[str, Any]]] = {segment.index: [] for segment in segments}
+    for frame in frames:
+        for segment_index in frame["segments"]:
+            frames_by_segment.setdefault(segment_index, []).append(frame)
+
+    lines: list[str] = []
+    lines.append("# TCP dialogue replay by `.bin` packet")
+    lines.append("")
+    lines.append("Báo cáo này tái hiện lại đúng thứ tự 192 chunk TCP trong capture. `UP` là client gửi lên server; `DOWN` là server trả về client.")
+    lines.append("")
+    lines.append("## Tóm tắt")
+    lines.append("")
+    lines.append(f"- App: `{metadata.get('app')}`")
+    lines.append(f"- Server: `{metadata.get('remoteIp')}:{metadata.get('remotePort')}`")
+    lines.append(f"- Capture time: `{metadata.get('time')}`")
+    lines.append(f"- TCP chunks: `{len(segments)}`")
+    lines.append(f"- Application frames sau khi ghép TCP stream: `{summary['frame_count']}` (`{summary['up_frames']}` UP, `{summary['down_frames']}` DOWN)")
+    lines.append("")
+    lines.append("## Cách đọc")
+    lines.append("")
+    lines.append("- Một `.bin` là một TCP data chunk do HttpCanary tách ra, không nhất thiết bằng đúng một application message.")
+    lines.append("- Nếu một chunk chứa nhiều application frame, phần `Frame(s)` sẽ liệt kê nhiều frame.")
+    lines.append("- Nếu một application frame bị TCP chia nhỏ qua nhiều `.bin`, báo cáo sẽ ghi `spans segments` để biết frame đó nằm ở các chunk nào.")
+    lines.append("- Payload dài được rút gọn trong báo cáo này; bản đầy đủ nằm ở `decoded/decoded_packets.json`.")
+    lines.append("")
+    lines.append("## Các bước chính của flow tạo avatar")
+    lines.append("")
+    notable_funcs = [
+        ("Login", "Client đăng nhập và gửi thông tin thiết bị/user/server."),
+        ("LoginResult", "Server trả session key dùng cho các request sau."),
+        ("QueryAvatarAttribute", "Client kiểm tra trạng thái avatar trước/sau khi tạo."),
+        ("CreateAvatar", "Client gửi yêu cầu tạo avatar."),
+        ("CreateAvatarResult", "Server xác nhận kết quả tạo avatar."),
+    ]
+    for func_name, explanation in notable_funcs:
+        matched = [frame for frame in frames if func_name in frame["decoded"].get("functions", [])]
+        if not matched:
+            continue
+        frame_refs = ", ".join(
+            f"frame `{frame['frame_index']:03d}` / packet(s) `{frame['segments']}`"
+            for frame in matched
+        )
+        lines.append(f"- **{func_name}**: {explanation} Xuất hiện tại {frame_refs}.")
+    lines.append("")
+    lines.append("Điểm quan trọng nhất trong capture: packet `9.bin` gửi `CreateAvatar` với `avatarName = BeetBoij`, `chiefBuddy = 1002`, `gender = 0`; server trả `CreateAvatarResult` thành công ở packet `11.bin` với `error_code = 0`.")
+    lines.append("")
+    lines.append("## Replay 192 TCP chunks")
+    lines.append("")
+
+    for segment in segments:
+        arrow = "UP client → server" if segment.direction_code == 1 else "DOWN server → client"
+        lines.append(f"### Packet {segment.index:03d} — `{segment.path}` — {arrow}")
+        lines.append("")
+        lines.append(f"- **Timestamp ms**: `{segment.timestamp_ms}`")
+        lines.append(f"- **TCP chunk length**: `{segment.length}` bytes")
+        segment_frames = frames_by_segment.get(segment.index, [])
+        if not segment_frames:
+            lines.append("- **Frame(s)**: chưa đủ dữ liệu để hoàn tất application frame tại chunk này.")
+            lines.append("")
+            continue
+        frame_ids = ", ".join(f"{frame['frame_index']:03d}" for frame in segment_frames)
+        lines.append(f"- **Frame(s)**: `{frame_ids}`")
+        for frame in segment_frames:
+            decoded = frame["decoded"]
+            funcs = ", ".join(decoded.get("functions", [])) or "—"
+            span = frame["segments"]
+            span_note = f"; spans segments `{span}`" if len(span) > 1 else ""
+            lines.append(f"  - **Frame {frame['frame_index']:03d}**{span_note}")
+            lines.append(f"    - Header: `{frame['header']['hex']}`")
+            lines.append(f"    - Total length: `{frame['total_length']}` bytes; codec: `{decoded.get('payload_codec')}`; format: `{decoded.get('message_format')}`")
+            lines.append(f"    - Func: `{funcs}`")
+            if "query" in decoded:
+                query = {k: v for k, v in decoded["query"].items() if k != "request"}
+                lines.append(f"    - Query fields: `{json.dumps(query, ensure_ascii=False, sort_keys=True)}`")
+            payload = compact_json(payload_object(decoded), max_chars=1800)
+            lines.append("    - Nội dung decoded:")
+            lines.append("      ```json")
+            lines.append("      " + payload.replace("\n", "\n      "))
+            lines.append("      ```")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_up_packet_guide(path: Path, metadata: dict[str, Any], frames: list[dict[str, Any]]) -> None:
+    """Write a guide for reconstructing authorized client-to-server packets."""
+    up_frames = [frame for frame in frames if frame["direction_code"] == 1]
+    lines: list[str] = []
+    lines.append("# Client-to-server UP packet construction guide")
+    lines.append("")
+    lines.append("Báo cáo này mô tả cấu tạo các gói `UP` trong capture để bạn có thể tái hiện lại flow trên môi trường bạn được phép kiểm thử. Không nên replay vào server thật nếu không có quyền, vì session/key/trạng thái server có thể thay đổi.")
+    lines.append("")
+    lines.append("## Cấu trúc chung của application frame")
+    lines.append("")
+    lines.append("Mỗi application frame trong TCP stream có dạng:")
+    lines.append("")
+    lines.append("```text")
+    lines.append("[16-byte header][payload]")
+    lines.append("```")
+    lines.append("")
+    lines.append("Header 16 byte quan sát được trong capture:")
+    lines.append("")
+    lines.append("| Offset | Size | Ý nghĩa suy luận từ capture |")
+    lines.append("| --- | ---: | --- |")
+    lines.append("| `0..3` | 4 | message id/checksum-like bytes; giữ nguyên nếu replay raw capture |")
+    lines.append("| `4..6` | 3 | tổng độ dài frame, big-endian 24-bit, bao gồm cả 16 byte header |")
+    lines.append("| `7` | 1 | flag/opcode; gói control dùng `0x0a`, `0x14`; request JSON thường là `0x00` |")
+    lines.append("| `8..14` | 7 | route/session-like bytes; trong request thường là `00 00 00 00 00 00 00` |")
+    lines.append("| `15` | 1 | sequence byte trong header; thường khớp `seq` URL query với request thường |")
+    lines.append("")
+    lines.append("Payload UP thường là URL-encoded query string UTF-8:")
+    lines.append("")
+    lines.append("```text")
+    lines.append("bv=7%2E0%2E2&request=<urlencoded-json-array>&seq=<n>&session=<session_key>&sptype=spv2jodo&version=7%2E0%2E2")
+    lines.append("```")
+    lines.append("")
+    lines.append("Pseudo-code tạo một frame UP mới từ payload:")
+    lines.append("")
+    lines.append("```python")
+    lines.append("payload = query_string.encode('utf-8')")
+    lines.append("total_len = 16 + len(payload)")
+    lines.append("header = bytearray(16)")
+    lines.append("header[4:7] = total_len.to_bytes(3, 'big')")
+    lines.append("header[7] = 0x00")
+    lines.append("header[15] = seq & 0xff")
+    lines.append("packet = bytes(header) + payload")
+    lines.append("```")
+    lines.append("")
+    lines.append("Lưu ý: 4 byte đầu header và một số byte flag/route có thể là checksum/message-id do client sinh. Với replay chính xác capture, cách an toàn nhất là dùng raw bytes trong các file `*.bin`; với request mới, cần reverse thêm thuật toán tạo 4 byte đầu nếu server kiểm tra.")
+    lines.append("")
+    lines.append("## Các UP frame trong capture")
+    lines.append("")
+    for frame in up_frames:
+        decoded = frame["decoded"]
+        funcs = ", ".join(decoded.get("functions", [])) or "control/empty"
+        lines.append(f"### UP frame {frame['frame_index']:03d} — Func: `{funcs}`")
+        lines.append("")
+        lines.append(f"- **Raw segment(s)**: `{frame['segments']}`")
+        lines.append(f"- **Header hex**: `{frame['header']['hex']}`")
+        lines.append(f"- **Total length**: `{frame['total_length']}` bytes")
+        lines.append(f"- **Header length bytes `4..6`**: `{frame['header']['hex'][8:14]}` = `{frame['total_length']}`")
+        lines.append(f"- **Flag/opcode byte `7`**: `{frame['header']['flag_or_opcode']}`")
+        lines.append(f"- **Header sequence byte `15`**: `{frame['header']['sequence_byte']}`")
+        if "query" in decoded:
+            query = {k: v for k, v in decoded["query"].items() if k != "request"}
+            lines.append(f"- **URL query fields**: `{json.dumps(query, ensure_ascii=False, sort_keys=True)}`")
+        lines.append("- **Decoded request/control payload**:")
+        lines.append("  ```json")
+        lines.append("  " + compact_json(payload_object(decoded), max_chars=2500).replace("\n", "\n  "))
+        lines.append("  ```")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".", help="Repository/capture root containing tcp.json, tcp.hcy, and *.bin")
     parser.add_argument("--out-json", default="decoded/decoded_packets.json")
     parser.add_argument("--out-md", default="decoded/decoded_packets.md")
+    parser.add_argument("--out-dialogue-md", default="decoded/tcp_192_packet_dialogue.md")
+    parser.add_argument("--out-up-guide-md", default="decoded/up_packet_construction.md")
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -322,13 +491,21 @@ def main() -> None:
     }
     out_json = root / args.out_json
     out_md = root / args.out_md
+    out_dialogue_md = root / args.out_dialogue_md
+    out_up_guide_md = root / args.out_up_guide_md
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_dialogue_md.parent.mkdir(parents=True, exist_ok=True)
+    out_up_guide_md.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     write_markdown(out_md, metadata, segments, frames, summary)
+    write_dialogue_markdown(out_dialogue_md, metadata, segments, frames, summary)
+    write_up_packet_guide(out_up_guide_md, metadata, frames)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     print(f"Wrote {out_json}")
     print(f"Wrote {out_md}")
+    print(f"Wrote {out_dialogue_md}")
+    print(f"Wrote {out_up_guide_md}")
 
 
 if __name__ == "__main__":
